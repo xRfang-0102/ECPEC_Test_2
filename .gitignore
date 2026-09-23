@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+
+# Trained artifacts (regenerate with train_feature.py / train.py)
+checkpoints/
+logs/
+
+# Large binaries (GitHub blocks files > 100 MB)
+pretrained/
+
+# Optional: extracted RoBERTa features (re-run extract_roberta_features.py)
+# features/
+
+# OS
+Thumbs.db
+.DS_Store

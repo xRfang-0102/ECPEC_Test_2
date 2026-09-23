@@ -1,0 +1,80 @@
+seed: 42
+
+data:
+  dataset: ECF
+
+  feature_root: features/ECF
+
+  train_feature_file: train_roberta.pt
+  dev_feature_file: dev_roberta.pt
+  test_feature_file: test_roberta.pt
+
+  max_dialogue_length: 40
+  num_workers: 0
+
+
+model:
+  input_dim: 768
+
+  dialogue_hidden: 256
+  dialogue_layers: 2
+  dialogue_heads: 4
+  dialogue_ffn: 1024
+
+  speaker_embedding_dim: 32
+  position_embedding_dim: 32
+
+  max_speakers: 20
+  max_positions: 64
+
+  auxiliary_hidden: 128
+
+  pair_hidden: 256
+
+  distance_embedding_dim: 32
+  speaker_relation_embedding_dim: 16
+  max_relative_distance: 15
+
+  dropout: 0.1
+
+
+training:
+  batch_size: 4
+  epochs: 20
+
+  module_lr: 0.0001
+  weight_decay: 0.01
+
+  # Stability additions vs config_feature_pos2.5.yaml:
+  warmup_epochs: 2          # linear LR warmup over the first 2 epochs
+  f1_smooth_window: 3       # checkpoint selection on 3-epoch smoothed Dev F1
+  ema_decay: 0.9            # Dev eval & best checkpoint use EMA-averaged weights
+  ema_start_epoch: 8        # start averaging only after the ramp-up phase
+
+  lambda_emotion: 0.2
+  lambda_cause: 0.4
+
+  pair_pos_weight: 2.5
+
+  # Scorer-side margin ranking: pushes positives above the top-3
+  # hardest negatives of their emotion-row, sharpening the borderline
+  # mass (reduces epoch-to-epoch P/R/F1 swings).
+  pair_rank_weight: 0.3
+  pair_rank_margin: 0.2
+  pair_rank_hard_negative_k: 3
+
+  max_grad_norm: 1.0
+  early_stop_patience: 6
+
+  checkpoint_path: checkpoints/base_feature_pos2.5_stable_best.pt
+
+
+evaluation:
+  threshold: 0.5
+  pair_threshold: 0.66       # dev-swept best threshold of the raw-logit baseline (F1 0.569)
+  row_normalize: false       # diagnostic only: row-centering destroys calibration (F1 0.37), do NOT use for reporting
+
+
+logging:
+  log_dir: logs/base_feature_pos2.5_stable
+  log_file: train_feature_pos2.5_stable.log

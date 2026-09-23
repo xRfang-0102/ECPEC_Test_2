@@ -1,0 +1,60 @@
+seed: 42
+
+data:
+  dataset: ECF
+  data_root: data/ECF
+  train_file: train.json
+  dev_file: dev.json
+  test_file: test.json
+  max_utterance_length: 128
+  max_dialogue_length: 40
+  num_workers: 4
+
+model:
+  encoder: pretrained/roberta-base
+
+  dialogue_hidden: 256
+  dialogue_layers: 2
+  dialogue_heads: 4
+  dialogue_ffn: 1024
+
+  speaker_embedding_dim: 32
+  position_embedding_dim: 32
+  max_speakers: 20
+  max_positions: 64
+
+  auxiliary_hidden: 128
+
+  distance_embedding_dim: 32
+  max_relative_distance: 15
+  speaker_relation_embedding_dim: 16
+
+  pair_hidden: 256
+  dropout: 0.1
+
+training:
+  batch_size: 4
+  epochs: 20
+
+  freeze_encoder: false
+
+  encoder_lr: 0.00002
+  module_lr: 0.0001
+  weight_decay: 0.01
+
+  lambda_emotion: 0.2
+  lambda_cause: 0.4
+
+  pair_pos_weight: 2.0
+
+  max_grad_norm: 1.0
+  early_stop_patience: 4
+
+  checkpoint_path: checkpoints/base_pos2.0_best.pt
+
+evaluation:
+  threshold: 0.5
+
+logging:
+  log_dir: logs/base_full_balanced_pos_2.0
+  log_file: train_pos_2.0.log
