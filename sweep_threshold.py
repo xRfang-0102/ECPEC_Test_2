@@ -489,6 +489,48 @@ def build_model(
             )
         ),
 
+        pair_node_gating=bool(
+            model_config.get(
+                "pair_node_gating",
+                False,
+            )
+        ),
+
+        use_event_retrieval=bool(
+            model_config.get(
+                "use_event_retrieval",
+                False,
+            )
+        ),
+
+        retrieval_key_dim=int(
+            model_config.get(
+                "retrieval_key_dim",
+                64,
+            )
+        ),
+
+        use_speaker_thread=bool(
+            model_config.get(
+                "use_speaker_thread",
+                True,
+            )
+        ),
+
+        use_historical_retrieval=bool(
+            model_config.get(
+                "use_historical_retrieval",
+                True,
+            )
+        ),
+
+        use_locality_prior=bool(
+            model_config.get(
+                "use_locality_prior",
+                False,
+            )
+        ),
+
         null_hidden=int(
             model_config.get(
                 "null_hidden",

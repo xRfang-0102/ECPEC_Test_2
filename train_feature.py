@@ -323,7 +323,14 @@ def masked_bce(
     labels,
     mask,
     pos_weight=None,
+    weight=None,
 ):
+    """
+    Masked BCE with optional per-element weight (same shape as logits).
+
+    When weight is given the loss is a WEIGHTED mean over valid
+    positions: sum(w_i * bce_i) / sum(w_i).
+    """
     mask = mask.bool()
 
     if mask.sum().item() == 0:
@@ -342,28 +349,85 @@ def masked_bce(
 
     if pos_weight is None:
 
-        return (
-            F.binary_cross_entropy_with_logits(
-                valid_logits,
-                valid_labels,
-            )
+        loss = F.binary_cross_entropy_with_logits(
+            valid_logits,
+            valid_labels,
+            reduction="none",
         )
 
-    weight_tensor = torch.tensor(
-        float(
-            pos_weight
-        ),
-        dtype=valid_logits.dtype,
-        device=valid_logits.device,
-    )
+    else:
 
-    return (
-        F.binary_cross_entropy_with_logits(
+        weight_tensor = torch.tensor(
+            float(
+                pos_weight
+            ),
+            dtype=valid_logits.dtype,
+            device=valid_logits.device,
+        )
+
+        loss = F.binary_cross_entropy_with_logits(
             valid_logits,
             valid_labels,
             pos_weight=weight_tensor,
+            reduction="none",
         )
+
+    if weight is None:
+        return loss.mean()
+
+    valid_weight = weight[
+        mask
+    ].to(loss.dtype)
+
+    return (
+        loss
+        * valid_weight
+    ).sum() / valid_weight.sum().clamp_min(1e-8)
+
+
+def build_pair_distance_weights(pair_logits, distance_weights):
+    """
+    Per-element positive-pair weight matrix [B, N, N].
+
+    distance_weights: list of 5 multipliers for the buckets
+        [d == 0, d == 1, d == 2, d >= 3, d <= -1]   (d = emotion_idx - cause_idx)
+    applied to POSITIVE pairs only; negatives keep weight 1.0.
+
+    Long-range pairs are rare (dev: distance >= 3 is ~10% of positives but
+    the baseline recalls 0% of them), so this upweights their training signal.
+    """
+    if len(distance_weights) != 5:
+        raise ValueError(
+            "pair_distance_weights must have 5 entries "
+            "for buckets [0, 1, 2, >=3, <=-1]."
+        )
+
+    batch, n, _ = pair_logits.shape
+    device = pair_logits.device
+    dtype = pair_logits.dtype
+
+    positions = torch.arange(n, device=device)
+    dist = positions.unsqueeze(1) - positions.unsqueeze(0)  # i - j
+
+    bucket = torch.where(
+        dist >= 3,
+        torch.full_like(dist, 3),
+        torch.where(
+            dist >= 0,
+            dist,
+            torch.full_like(dist, 4),
+        ),
+    )  # 0,1,2 keep value; >=3 -> 3; <=-1 -> 4
+
+    mult = torch.tensor(
+        distance_weights,
+        dtype=dtype,
+        device=device,
     )
+
+    weights = mult[bucket]  # [N, N]
+
+    return weights.unsqueeze(0).expand(batch, -1, -1).contiguous()
 
 
 def decision_pair_logits(outputs):
@@ -438,7 +502,7 @@ def null_ranking_loss(raw_logits, null_logits, labels, pair_mask, utterance_mask
 
 
 def pair_ranking_loss(pair_logits, labels, pair_mask, utterance_mask,
-                      margin=0.2, hard_negative_k=3):
+                      margin=0.2, hard_negative_k=3, positive_weights=None):
     """
     Scorer-side margin ranking: pull every positive pair above the top-k
     hardest negatives of its emotion-row.
@@ -447,6 +511,10 @@ def pair_ranking_loss(pair_logits, labels, pair_mask, utterance_mask,
     It sharpens the score distribution around the decision boundary, which
     reduces the mass of borderline pairs and therefore the epoch-to-epoch
     P/R/F1 swings caused by small score-drift on a small Dev set.
+
+    positive_weights: optional [B, N, N] tensor; each positive's ranking
+    term is weighted by its entry (e.g. distance-aware upweighting of
+    long-range positives).
     """
     if hard_negative_k < 1:
         raise ValueError("pair_rank_hard_negative_k must be >= 1")
@@ -464,17 +532,202 @@ def pair_ranking_loss(pair_logits, labels, pair_mask, utterance_mask,
             hard = negative.topk(
                 min(hard_negative_k, negative.numel())
             ).values
-            rows.append(
-                F.softplus(
-                    margin
-                    + hard.unsqueeze(-1)
-                    - positive.unsqueeze(0)
-                ).mean()
-            )
+
+            term = F.softplus(
+                margin
+                + hard.unsqueeze(-1)
+                - positive.unsqueeze(0)
+            )  # [k, p]
+
+            if positive_weights is not None:
+                pos_w = (
+                    positive_weights[b, i][mask[b, i]][row_labels == 1]
+                ).to(term.dtype)
+
+                rows.append(
+                    (
+                        term
+                        * pos_w.unsqueeze(0)
+                    ).sum()
+                    / pos_w.sum().clamp_min(1e-8)
+                )
+            else:
+                rows.append(term.mean())
     if not rows:
         # Differentiable zero without reading padding positions.
         return pair_logits[valid & mask.any(dim=-1)].sum() * 0.0
     return torch.stack(rows).mean()
+
+
+def conditional_ranking_loss(content_logits, labels, pair_mask, utterance_mask,
+                             margin=0.2, hard_negative_k=3):
+    """
+    Causal-intervention objective for the locality shortcut.
+
+    The content classifier must separate positives from negatives
+    CONDITIONED on the relative distance: within each (row, distance
+    bucket) cell, positives must outrank the top-k negatives of the
+    SAME distance. A model that only memorized the distance prior
+    (self/near pairs) cannot satisfy this — long-range positives must
+    be justified by content evidence, which is exactly where the
+    baseline has 0% recall.
+    """
+    if hard_negative_k < 1:
+        raise ValueError("cond_rank_hard_negative_k must be >= 1")
+    if margin < 0:
+        raise ValueError("cond_rank_margin must be >= 0")
+
+    valid = utterance_mask.bool()
+    mask = pair_mask.bool() & valid.unsqueeze(2) & valid.unsqueeze(1)
+
+    n = content_logits.shape[1]
+    device = content_logits.device
+
+    positions = torch.arange(n, device=device)
+    dist = positions.unsqueeze(1) - positions.unsqueeze(0)
+
+    bucket = torch.where(
+        dist >= 3,
+        torch.full_like(dist, 3),
+        torch.where(
+            dist >= 0,
+            dist,
+            torch.full_like(dist, 4),
+        ),
+    )
+
+    rows = []
+
+    for b, i in (valid & mask.any(dim=-1)).nonzero(as_tuple=False):
+
+        row_scores = content_logits[b, i][mask[b, i]]
+        row_labels = labels[b, i][mask[b, i]]
+        row_bucket = bucket[i][mask[b, i]]
+
+        for bucket_id in range(5):
+
+            positive = row_scores[
+                (row_labels == 1)
+                & (row_bucket == bucket_id)
+            ]
+
+            negative = row_scores[
+                (row_labels == 0)
+                & (row_bucket == bucket_id)
+            ]
+
+            if positive.numel() and negative.numel():
+
+                hard = negative.topk(
+                    min(hard_negative_k, negative.numel())
+                ).values
+
+                rows.append(
+                    F.softplus(
+                        margin
+                        + hard.unsqueeze(-1)
+                        - positive.unsqueeze(0)
+                    ).mean()
+                )
+
+    if not rows:
+        return content_logits[valid & mask.any(dim=-1)].sum() * 0.0
+
+    return torch.stack(rows).mean()
+
+
+def retrieval_attention_loss(attn, labels, pair_mask, utterance_mask, target_mask=None):
+    """
+    Supervise the retrieval attention: each emotion row's attention
+    should concentrate on its true causes (optionally restricted to
+    positions allowed by target_mask).
+    """
+    valid = utterance_mask.bool()
+    mask = pair_mask.bool() & valid.unsqueeze(2) & valid.unsqueeze(1)
+
+    if target_mask is not None:
+        eligible = mask & target_mask.bool()
+    else:
+        eligible = mask
+
+    losses = []
+
+    for b, i in (valid & eligible.any(dim=-1)).nonzero(as_tuple=False):
+
+        row_labels = labels[b, i][eligible[b, i]]
+
+        if row_labels.sum().item() <= 0:
+            continue
+
+        row_attn = attn[b, i][eligible[b, i]]
+
+        target = (
+            row_labels
+            / row_labels.sum().clamp_min(1e-8)
+        )
+
+        losses.append(
+            -(
+                target
+                * (row_attn + 1e-9).log()
+            ).sum()
+        )
+
+    if not losses:
+        return attn[valid & mask.any(dim=-1)].sum() * 0.0
+
+    return torch.stack(losses).mean()
+
+
+def historical_retrieval_loss(hist_attn, labels, pair_mask, utterance_mask, speaker_ids):
+    """
+    Supervise the historical (distance >= 2, cross-speaker) retrieval
+    head using ONLY long-range positives. Mirrors the mask used inside
+    EventMemoryRetriever exactly.
+    """
+    valid = utterance_mask.bool()
+    base = pair_mask.bool() & valid.unsqueeze(2) & valid.unsqueeze(1)
+
+    n = labels.shape[1]
+    device = labels.device
+
+    positions = torch.arange(n, device=device)
+    dist = positions.unsqueeze(1) - positions.unsqueeze(0)
+
+    cross_speaker = (
+        speaker_ids.unsqueeze(2)
+        != speaker_ids.unsqueeze(1)
+    )
+
+    hist_mask = base & (dist >= 2) & cross_speaker
+
+    losses = []
+
+    for b, i in (valid & hist_mask.any(dim=-1)).nonzero(as_tuple=False):
+
+        row_labels = labels[b, i][hist_mask[b, i]]
+
+        if row_labels.sum().item() <= 0:
+            continue
+
+        row_attn = hist_attn[b, i][hist_mask[b, i]]
+
+        target = (
+            row_labels
+            / row_labels.sum().clamp_min(1e-8)
+        )
+
+        losses.append(
+            -(
+                target
+                * (row_attn + 1e-9).log()
+            ).sum()
+        )
+
+    if not losses:
+        return hist_attn[valid & hist_mask.any(dim=-1)].sum() * 0.0
+
+    return torch.stack(losses).mean()
 
 
 def optimizer_parameters(model):
@@ -678,6 +931,14 @@ def compute_losses(
     pair_rank_weight=0.0,
     pair_rank_margin=0.2,
     pair_rank_hard_negative_k=3,
+    pair_distance_weights=None,
+    cond_rank_weight=0.0,
+    cond_rank_margin=0.2,
+    cond_rank_hard_negative_k=3,
+    retrieval_loss_weight=0.0,
+    retrieval_local_max_distance=1,
+    historical_retrieval_weight=0.0,
+    locality_prior_reg_weight=0.0,
 ):
     emotion_loss = masked_bce(
         logits=outputs[
@@ -703,6 +964,18 @@ def compute_losses(
         ],
     )
 
+    # --------------------------------------------------
+    # Distance-aware positive weighting (long-range fixes)
+    # --------------------------------------------------
+
+    pair_weight = None
+
+    if pair_distance_weights is not None:
+        pair_weight = build_pair_distance_weights(
+            outputs["pair_logits"],
+            pair_distance_weights,
+        )
+
     pair_loss = masked_bce(
         logits=(outputs["pair_logits"] if "null_logits" in outputs
                 else decision_pair_logits(outputs)),
@@ -715,6 +988,7 @@ def compute_losses(
         pos_weight=(
             pair_pos_weight
         ),
+        weight=pair_weight,
     )
 
     total_loss = (
@@ -746,9 +1020,86 @@ def compute_losses(
             batch["utterance_mask"],
             margin=pair_rank_margin,
             hard_negative_k=pair_rank_hard_negative_k,
+            positive_weights=pair_weight,
         )
         result["pair_rank_loss"] = rank_loss
         result["total_loss"] = total_loss + pair_rank_weight * rank_loss
+
+    # --------------------------------------------------
+    # C: conditional ranking on CONTENT logits
+    #    (causal intervention on the locality shortcut)
+    # --------------------------------------------------
+
+    if cond_rank_weight > 0 and "content_pair_logits" in outputs:
+        cond_loss = conditional_ranking_loss(
+            outputs["content_pair_logits"],
+            batch["pair_labels"],
+            batch["pair_mask"],
+            batch["utterance_mask"],
+            margin=cond_rank_margin,
+            hard_negative_k=cond_rank_hard_negative_k,
+        )
+        result["cond_rank_loss"] = cond_loss
+        result["total_loss"] = result["total_loss"] + cond_rank_weight * cond_loss
+
+    # --------------------------------------------------
+    # A: retrieval supervision (attend to true causes)
+    # --------------------------------------------------
+
+    if retrieval_loss_weight > 0 and "retrieval_attn" in outputs:
+
+        # Local head: supervised on near positives only (dist <= k),
+        # so the historical head owns the long-range evidence.
+        if retrieval_local_max_distance is not None:
+            n = outputs["retrieval_attn"].shape[1]
+            positions = torch.arange(
+                n,
+                device=outputs["retrieval_attn"].device,
+            )
+            dist = positions.unsqueeze(1) - positions.unsqueeze(0)
+            local_target_mask = (
+                (dist <= retrieval_local_max_distance)
+                & (dist >= -retrieval_local_max_distance)
+            ).unsqueeze(0).expand(
+                outputs["retrieval_attn"].shape[0],
+                -1,
+                -1,
+            )
+        else:
+            local_target_mask = None
+
+        ret_loss = retrieval_attention_loss(
+            outputs["retrieval_attn"],
+            batch["pair_labels"],
+            batch["pair_mask"],
+            batch["utterance_mask"],
+            target_mask=local_target_mask,
+        )
+        result["retrieval_loss"] = ret_loss
+        result["total_loss"] = result["total_loss"] + retrieval_loss_weight * ret_loss
+
+    # Historical head: supervised by long-range positives only.
+    if historical_retrieval_weight > 0 and "hist_retrieval_attn" in outputs:
+        hist_loss = historical_retrieval_loss(
+            outputs["hist_retrieval_attn"],
+            batch["pair_labels"],
+            batch["pair_mask"],
+            batch["utterance_mask"],
+            batch["speaker_ids"],
+        )
+        result["hist_retrieval_loss"] = hist_loss
+        result["total_loss"] = result["total_loss"] + historical_retrieval_weight * hist_loss
+
+    # --------------------------------------------------
+    # Locality prior regularizer (keep the shortcut head
+    # bounded so it cannot absorb all the gradient).
+    # --------------------------------------------------
+
+    if locality_prior_reg_weight > 0 and "locality_bias" in outputs:
+        bias = outputs["locality_bias"][batch["pair_mask"].bool()]
+        bias_loss = bias.square().mean() if bias.numel() else bias.sum() * 0.0
+        result["locality_prior_reg_loss"] = bias_loss
+        result["total_loss"] = result["total_loss"] + locality_prior_reg_weight * bias_loss
     if "null_logits" in outputs:
         rank_loss = null_ranking_loss(
             outputs["pair_logits"], outputs["null_logits"],
@@ -1087,6 +1438,10 @@ class LossAccumulator:
         self.num_batches = 0
         self.null_rank_loss = None
         self.pair_rank_loss = None
+        self.cond_rank_loss = None
+        self.retrieval_loss = None
+        self.hist_retrieval_loss = None
+        self.locality_prior_reg_loss = None
         self.residual_reg_loss = None
         self.hierarchical_losses = {}
 
@@ -1130,6 +1485,14 @@ class LossAccumulator:
             self.null_rank_loss = (self.null_rank_loss or 0.0) + losses["null_rank_loss"].detach().item()
         if "pair_rank_loss" in losses:
             self.pair_rank_loss = (self.pair_rank_loss or 0.0) + losses["pair_rank_loss"].detach().item()
+        if "cond_rank_loss" in losses:
+            self.cond_rank_loss = (self.cond_rank_loss or 0.0) + losses["cond_rank_loss"].detach().item()
+        if "retrieval_loss" in losses:
+            self.retrieval_loss = (self.retrieval_loss or 0.0) + losses["retrieval_loss"].detach().item()
+        if "hist_retrieval_loss" in losses:
+            self.hist_retrieval_loss = (self.hist_retrieval_loss or 0.0) + losses["hist_retrieval_loss"].detach().item()
+        if "locality_prior_reg_loss" in losses:
+            self.locality_prior_reg_loss = (self.locality_prior_reg_loss or 0.0) + losses["locality_prior_reg_loss"].detach().item()
         if "residual_reg_loss" in losses:
             self.residual_reg_loss = (self.residual_reg_loss or 0.0) + losses["residual_reg_loss"].detach().item()
         for key in ("dialogue_reg_loss", "row_reg_loss"):
@@ -1150,6 +1513,10 @@ class LossAccumulator:
             **({"residual_reg_loss": self.residual_reg_loss / denominator} if self.residual_reg_loss is not None else {}),
             **({"null_rank_loss": self.null_rank_loss / denominator} if self.null_rank_loss is not None else {}),
             **({"pair_rank_loss": self.pair_rank_loss / denominator} if self.pair_rank_loss is not None else {}),
+            **({"cond_rank_loss": self.cond_rank_loss / denominator} if self.cond_rank_loss is not None else {}),
+            **({"retrieval_loss": self.retrieval_loss / denominator} if self.retrieval_loss is not None else {}),
+            **({"hist_retrieval_loss": self.hist_retrieval_loss / denominator} if self.hist_retrieval_loss is not None else {}),
+            **({"locality_prior_reg_loss": self.locality_prior_reg_loss / denominator} if self.locality_prior_reg_loss is not None else {}),
             "total_loss":
                 self.total_loss
                 / denominator,
@@ -2514,6 +2881,12 @@ def run_training(
     model = (
         FeatureECPECBaseModel(
             pair_decision_mode=model_config.get("pair_decision_mode", "fixed"),
+            pair_node_gating=bool(model_config.get("pair_node_gating", False)),
+            use_event_retrieval=bool(model_config.get("use_event_retrieval", False)),
+            retrieval_key_dim=int(model_config.get("retrieval_key_dim", 64)),
+            use_speaker_thread=bool(model_config.get("use_speaker_thread", True)),
+            use_historical_retrieval=bool(model_config.get("use_historical_retrieval", True)),
+            use_locality_prior=bool(model_config.get("use_locality_prior", False)),
             null_hidden=int(model_config.get("null_hidden", 128)),
             null_residual_hidden=int(model_config.get("null_residual_hidden", 128)),
             null_residual_scale=float(model_config.get("null_residual_scale", 0.5)),
@@ -2696,6 +3069,35 @@ def run_training(
         "pair_rank_hard_negative_k": int(training_config.get("pair_rank_hard_negative_k", 3)),
     })
 
+    # Distance-aware positive weighting for the long-range blind spot:
+    # buckets [d=0, d=1, d=2, d>=3, d<=-1].
+    distance_weights = training_config.get(
+        "pair_distance_weights",
+        None,
+    )
+
+    if distance_weights is not None:
+        null_loss_options["pair_distance_weights"] = [
+            float(weight)
+            for weight in distance_weights
+        ]
+
+    # A+C objectives: conditional ranking (causal intervention),
+    # retrieval supervision, locality-prior regularizer.
+    null_loss_options.update({
+        "cond_rank_weight": float(training_config.get("cond_rank_weight", 0.0)),
+        "cond_rank_margin": float(training_config.get("cond_rank_margin", 0.2)),
+        "cond_rank_hard_negative_k": int(training_config.get("cond_rank_hard_negative_k", 3)),
+        "retrieval_loss_weight": float(training_config.get("retrieval_loss_weight", 0.0)),
+        "retrieval_local_max_distance": (
+            None
+            if training_config.get("retrieval_local_max_distance") is None
+            else int(training_config.get("retrieval_local_max_distance", 1))
+        ),
+        "historical_retrieval_weight": float(training_config.get("historical_retrieval_weight", 0.0)),
+        "locality_prior_reg_weight": float(training_config.get("locality_prior_reg_weight", 0.0)),
+    })
+
     if model.pair_decision_mode == "hierarchical_boundary":
         null_loss_options.update({
             "hierarchical_dialogue_reg_weight": float(training_config.get("hierarchical_dialogue_reg_weight", 0.005)),
@@ -2721,6 +3123,39 @@ def run_training(
                 if key.startswith("pair_rank")
             },
         )
+
+    if null_loss_options.get("pair_distance_weights") is not None:
+        print(
+            "Pair distance weights [d=0, d=1, d=2, d>=3, d<=-1]:",
+            null_loss_options["pair_distance_weights"],
+        )
+
+    if model_config.get("use_event_retrieval", False):
+        print(
+            "Event memory retrieval: enabled "
+            f"(key_dim={model_config.get('retrieval_key_dim', 64)}, "
+            f"speaker_thread={model_config.get('use_speaker_thread', True)})"
+        )
+
+    if model_config.get("use_locality_prior", False):
+        print("Locality prior head: enabled")
+
+    ac_options = {
+        key: null_loss_options[key]
+        for key in (
+            "cond_rank_weight",
+            "cond_rank_margin",
+            "cond_rank_hard_negative_k",
+            "retrieval_loss_weight",
+            "retrieval_local_max_distance",
+            "historical_retrieval_weight",
+            "locality_prior_reg_weight",
+        )
+        if null_loss_options.get(key) not in (None, 0.0)
+    }
+
+    if ac_options:
+        print("A+C options:", ac_options)
 
     module_lr = float(
         training_config.get(

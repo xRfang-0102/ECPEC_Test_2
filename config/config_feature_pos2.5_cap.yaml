@@ -1,0 +1,78 @@
+seed: 42
+
+data:
+  dataset: ECF
+
+  feature_root: features/ECF
+
+  train_feature_file: train_roberta.pt
+  dev_feature_file: dev_roberta.pt
+  test_feature_file: test_roberta.pt
+
+  max_dialogue_length: 40
+  num_workers: 0
+
+
+model:
+  input_dim: 768
+
+  # Capacity experiment: deeper/wider dialogue encoder for long-range
+  # evidence propagation (baseline: 256 / 2 layers / 4 heads / ffn 1024).
+  dialogue_hidden: 256
+  dialogue_layers: 4
+  dialogue_heads: 8
+  dialogue_ffn: 2048
+
+  speaker_embedding_dim: 32
+  position_embedding_dim: 32
+
+  max_speakers: 20
+  max_positions: 64
+
+  auxiliary_hidden: 128
+
+  pair_hidden: 256
+
+  distance_embedding_dim: 32
+  speaker_relation_embedding_dim: 16
+  max_relative_distance: 15
+
+  dropout: 0.1
+
+
+training:
+  batch_size: 4
+  epochs: 20
+
+  module_lr: 0.0001
+  weight_decay: 0.01
+
+  warmup_epochs: 2
+  f1_smooth_window: 3
+  ema_decay: 0.9
+  ema_start_epoch: 8
+
+  lambda_emotion: 0.2
+  lambda_cause: 0.4
+
+  pair_pos_weight: 2.5
+
+  pair_rank_weight: 0.3
+  pair_rank_margin: 0.2
+  pair_rank_hard_negative_k: 3
+
+  max_grad_norm: 1.0
+  early_stop_patience: 6
+
+  checkpoint_path: checkpoints/base_feature_pos2.5_cap_best.pt
+
+
+evaluation:
+  threshold: 0.5
+  pair_threshold: 0.66
+  row_normalize: false
+
+
+logging:
+  log_dir: logs/base_feature_pos2.5_cap
+  log_file: train_feature_pos2.5_cap.log

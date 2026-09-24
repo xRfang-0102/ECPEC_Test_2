@@ -16,6 +16,7 @@ pretrained/
 
 # Optional: extracted RoBERTa features (re-run extract_roberta_features.py)
 # features/
+features/ECF/*_roberta_mean.pt
 
 # OS
 Thumbs.db

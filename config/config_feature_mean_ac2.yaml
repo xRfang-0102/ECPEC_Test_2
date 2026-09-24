@@ -1,0 +1,94 @@
+seed: 42
+
+data:
+  dataset: ECF
+
+  feature_root: features/ECF
+
+  train_feature_file: train_roberta_mean.pt
+  dev_feature_file: dev_roberta_mean.pt
+  test_feature_file: test_roberta_mean.pt
+
+  max_dialogue_length: 40
+  num_workers: 0
+
+
+model:
+  input_dim: 768
+
+  dialogue_hidden: 256
+  dialogue_layers: 2
+  dialogue_heads: 4
+  dialogue_ffn: 1024
+
+  speaker_embedding_dim: 32
+  position_embedding_dim: 32
+
+  max_speakers: 20
+  max_positions: 64
+
+  auxiliary_hidden: 128
+
+  pair_hidden: 256
+
+  distance_embedding_dim: 32
+  speaker_relation_embedding_dim: 16
+  max_relative_distance: 15
+
+  dropout: 0.1
+
+  # ---- A v2: dual event-memory retrieval ----
+  use_event_retrieval: true
+  retrieval_key_dim: 64
+  use_speaker_thread: true
+  use_historical_retrieval: true    # constrained: dist>=2 & cross-speaker
+
+  # ---- C: locality prior (structural shortcut head) ----
+  use_locality_prior: true
+
+
+training:
+  batch_size: 16
+  epochs: 20
+
+  module_lr: 0.0001
+  weight_decay: 0.01
+
+  warmup_epochs: 2
+  f1_smooth_window: 3
+  ema_decay: 0.9
+  ema_start_epoch: 8
+
+  lambda_emotion: 0.2
+  lambda_cause: 0.4
+
+  pair_pos_weight: 2.5
+
+  pair_rank_weight: 0.3
+  pair_rank_margin: 0.2
+  pair_rank_hard_negative_k: 3
+
+  # ---- A+C v2 objectives ----
+  cond_rank_weight: 0.3
+  cond_rank_margin: 0.2
+  cond_rank_hard_negative_k: 3
+  retrieval_loss_weight: 0.1          # local head supervised on dist<=1
+  retrieval_local_max_distance: 1
+  historical_retrieval_weight: 0.1    # historical head supervised on far positives
+  locality_prior_reg_weight: 0.001
+
+  max_grad_norm: 1.0
+  early_stop_patience: 6
+
+  checkpoint_path: checkpoints/base_feature_mean_ac2_best.pt
+
+
+evaluation:
+  threshold: 0.5
+  pair_threshold: 0.66
+  row_normalize: false
+
+
+logging:
+  log_dir: logs/base_feature_mean_ac2
+  log_file: train_feature_mean_ac2.log

@@ -70,6 +70,17 @@ def parse_args():
         help="Overwrite existing feature files.",
     )
 
+    parser.add_argument(
+        "--pooling",
+        type=str,
+        default="cls",
+        choices=["cls", "mean"],
+        help=(
+            "RoBERTa pooling strategy: cls token (original) "
+            "or attention-masked mean pooling."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -301,10 +312,16 @@ def encode_utterances(
     device,
     batch_size,
     max_length,
+    pooling="cls",
 ):
     if len(texts) == 0:
         raise ValueError(
             "No utterances found."
+        )
+
+    if pooling not in ("cls", "mean"):
+        raise ValueError(
+            f"Unknown pooling: {pooling}"
         )
 
     hidden_size = int(
@@ -392,18 +409,33 @@ def encode_utterances(
                 **model_inputs
             )
 
-            # Same representation as current
-            # UtteranceEncoder:
-            #
-            # last_hidden_state[:, 0, :]
-            #
+            # Pooling:
+            #   cls  = last_hidden_state[:, 0, :]   (original)
+            #   mean = attention-masked mean pooling over tokens
+            #          (richer content signal for long-range matching)
+            if pooling == "mean":
+                token_mask = (
+                    model_inputs["attention_mask"]
+                    .unsqueeze(-1)
+                    .to(outputs.last_hidden_state.dtype)
+                )
+
+                batch_features = (
+                    outputs.last_hidden_state
+                    * token_mask
+                ).sum(dim=1) / token_mask.sum(dim=1).clamp_min(1.0)
+            else:
+                batch_features = (
+                    outputs
+                    .last_hidden_state[
+                        :,
+                        0,
+                        :
+                    ]
+                )
+
             batch_features = (
-                outputs
-                .last_hidden_state[
-                    :,
-                    0,
-                    :
-                ]
+                batch_features
                 .detach()
                 .float()
                 .cpu()
@@ -723,6 +755,7 @@ def extract_split(
     max_length,
     max_dialogue_length,
     overwrite,
+    pooling="cls",
 ):
     print()
     print(
@@ -797,6 +830,7 @@ def extract_split(
         device=device,
         batch_size=batch_size,
         max_length=max_length,
+        pooling=pooling,
     )
 
     print(
@@ -1143,13 +1177,25 @@ def main():
 
     output_name_map = {
         "train":
-            "train_roberta.pt",
+            (
+                "train_roberta.pt"
+                if args.pooling == "cls"
+                else "train_roberta_mean.pt"
+            ),
 
         "dev":
-            "dev_roberta.pt",
+            (
+                "dev_roberta.pt"
+                if args.pooling == "cls"
+                else "dev_roberta_mean.pt"
+            ),
 
         "test":
-            "test_roberta.pt",
+            (
+                "test_roberta.pt"
+                if args.pooling == "cls"
+                else "test_roberta_mean.pt"
+            ),
     }
 
     for split in args.splits:
@@ -1205,6 +1251,10 @@ def main():
 
             max_dialogue_length=(
                 max_dialogue_length
+            ),
+
+            pooling=(
+                args.pooling
             ),
 
             overwrite=(
